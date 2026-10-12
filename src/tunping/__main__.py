@@ -13,6 +13,7 @@ with time.monotonic(). Works via SOCKS-TUN and via plain L3 tunnels.
 from __future__ import annotations
 
 import argparse
+import errno
 import ipaddress
 import json
 import socket
@@ -83,6 +84,55 @@ def drain_headers(sock: socket.socket) -> bool:
         return False
 
 
+def bind_to_device(sock: socket.socket, ifname: str) -> None:
+    """Pin socket egress to an interface, bypassing the routing table.
+
+    Unprivileged since Linux 5.7 as long as the socket is not already
+    bound, so always call on a fresh socket before connect().
+    """
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, ifname.encode() + b"\x00")
+
+
+def validate_iface(ifname: str) -> None:
+    """Fail fast if an interface cannot be bound. Raises OSError."""
+    if not hasattr(socket, "SO_BINDTODEVICE"):
+        raise OSError("SO_BINDTODEVICE is not available on this OS")
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        bind_to_device(probe, ifname)
+    except OSError as e:
+        if e.errno in (errno.EPERM, errno.EACCES):
+            raise OSError(
+                f"cannot bind to '{ifname}': denied "
+                f"(old kernel or restricted policy)"
+            ) from e
+        raise OSError(f"cannot bind to '{ifname}': {e}") from e
+    finally:
+        probe.close()
+
+
+def ttfb_probe(sock: socket.socket, request: bytes,
+               timeout: float) -> tuple[bool, float, str, bool]:
+    """One HEAD -> first-byte measurement on a live socket.
+
+    Returns (ok, rtt_ms, err, conn_dead). conn_dead tells the caller to
+    reconnect before the next probe; the current probe may still be ok.
+    """
+    try:
+        sock.settimeout(timeout)
+        t0 = time.monotonic()
+        sock.sendall(request)
+        first = sock.recv(1)
+        t1 = time.monotonic()
+        if not first:
+            return False, 0.0, "connection closed before first byte", True
+        dead = not drain_headers(sock)
+        return True, (t1 - t0) * 1000.0, "", dead
+    except (socket.timeout, OSError) as e:
+        err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        return False, 0.0, err, True
+
+
 def create_connection(
     host: str,
     port: int,
@@ -90,6 +140,7 @@ def create_connection(
     use_tls: bool,
     sni: str | None,
     insecure: bool,
+    bind_if: str | None = None,
 ) -> tuple[socket.socket, str]:
     """Try all getaddrinfo results, return (sock, ip_str) or raise OSError."""
     server_hostname = sni or host
@@ -100,6 +151,12 @@ def create_connection(
         try:
             raw = socket.socket(family, socktype, proto)
             raw.settimeout(timeout)
+            if bind_if:
+                try:
+                    bind_to_device(raw, bind_if)
+                except OSError:
+                    raw.close()
+                    raise
             raw.connect(sockaddr)
             if not use_tls:
                 return raw, ip_str
@@ -146,10 +203,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="skip TLS cert verification (useful with IP + custom SNI)")
     p.add_argument("--json", action="store_true",
                    help="machine-readable JSON lines output")
+    p.add_argument("--compare", nargs=2, metavar=("IFACE1", "IFACE2"), default=None,
+                   help="pin probes to two interfaces and compare TTFB side by side, "
+                        "e.g. --compare amn0 enp14s0 (unprivileged on Linux >= 5.7)")
+    p.add_argument("--warmup", type=int, default=1,
+                   help="skip first N rounds in stats (cold start, default 1); 0 disables")
     p.add_argument("-v", "--version", action="version", version=f"tunping {__version__}")
     args = p.parse_args(argv)
     if args.count < 0:
         p.error("count must be >= 0")
+    if args.warmup < 0:
+        p.error("warmup must be >= 0")
     if args.interval < 0 or args.timeout <= 0:
         p.error("interval must be >= 0 and timeout > 0")
     if not 1 <= args.port <= 65535:
@@ -196,6 +260,8 @@ def print_summary(args: argparse.Namespace, transmitted: int,
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.compare:
+        return run_compare(args)
     use_tls = args.proto == "https"
     host_header = args.sni or args.host
     if args.port not in (80, 443):
@@ -211,24 +277,21 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     if not args.json:
-        print(
-            f"TUNPING {args.host} ({resolved_ip}:{args.port}) "
-            f"with {args.proto.upper()} TTFB "
-            f"(not ICMP; for TUNs that answer ping locally)"
-        )
+        print(f"TUNPING {args.host} ({resolved_ip}:{args.port}) with HTTPS TTFB")
 
     transmitted = 0
     rtts: list[float] = []
     sock: socket.socket | None = None
     sock_ip = resolved_ip
     seq = 0
+    counted = 0
 
     try:
         while True:
-            seq += 1
-            if args.count and seq > args.count:
+            if args.count and counted >= args.count:
                 break
-            transmitted += 1
+            seq += 1
+            is_warm = seq <= args.warmup
             loop_start = time.monotonic()
             ok = False
             rtt_ms = 0.0
@@ -246,48 +309,37 @@ def main(argv: list[str] | None = None) -> int:
                     sock = None
 
             if sock is not None:
-                try:
-                    sock.settimeout(args.timeout)
-                    t0 = time.monotonic()
-                    sock.sendall(request)
-                    first = sock.recv(1)
-                    t1 = time.monotonic()
-                    if not first:
-                        raise OSError("connection closed before first byte")
-                    rtt_ms = (t1 - t0) * 1000.0
+                ok, rtt_ms, err, dead = ttfb_probe(sock, request, args.timeout)
+                if ok and not is_warm:
                     rtts.append(rtt_ms)
-                    ok = True
-                    # Drain rest of headers so next HEAD stays in sync.
-                    if not drain_headers(sock):
-                        try:
-                            sock.close()
-                        except OSError:
-                            pass
-                        sock = None
-                except (socket.timeout, OSError) as e:
-                    err = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                if dead:
                     try:
                         sock.close()
                     except OSError:
                         pass
                     sock = None
+            if not is_warm:
+                counted += 1
+                transmitted += 1
 
             if args.json:
                 rec: dict = {"type": "probe", "seq": seq, "ok": ok,
-                             "host": args.host, "ip": sock_ip, "port": args.port}
+                             "host": args.host, "ip": sock_ip, "port": args.port,
+                             "warmup": is_warm}
                 if ok:
                     rec["ttfb_ms"] = round(rtt_ms, 3)
                 else:
                     rec["error"] = err or "timeout"
                 print(json.dumps(rec), flush=True)
             else:
+                tag = " (warmup)" if is_warm else ""
                 if ok:
                     print(f"response from {args.host} ({sock_ip}): "
-                          f"seq={seq} ttfb={rtt_ms:.1f} ms")
+                          f"seq={seq} ttfb={rtt_ms:.1f} ms{tag}")
                 else:
-                    print(f"request timeout for seq={seq} ({err or 'timeout'})")
+                    print(f"request timeout for seq={seq} ({err or 'timeout'}){tag}")
 
-            if args.count and seq >= args.count:
+            if args.count and counted >= args.count:
                 break
             elapsed = time.monotonic() - loop_start
             to_sleep = args.interval - elapsed
@@ -304,6 +356,167 @@ def main(argv: list[str] | None = None) -> int:
             pass
 
     return print_summary(args, transmitted, rtts, resolved_ip)
+
+
+def print_compare_summary(args: argparse.Namespace, ifaces: list[str],
+                            transmitted: list[int],
+                            rtts: list[list[float]]) -> int:
+    a, b = ifaces
+    received_total = len(rtts[0]) + len(rtts[1])
+    stats = [calc_stats(r) for r in rtts]
+    jitters = [calc_jitter(r) for r in rtts]
+    overhead = None
+    if stats[0] and stats[1]:
+        overhead = stats[0]["avg"] - stats[1]["avg"]
+    if args.json:
+        series = {}
+        for idx, ifname in enumerate(ifaces):
+            t = transmitted[idx]
+            r = len(rtts[idx])
+            st, jt = stats[idx], jitters[idx]
+            series[ifname] = {
+                "transmitted": t,
+                "received": r,
+                "loss_pct": round(100.0 * (t - r) / t, 2) if t else 0.0,
+                "rtt_min_ms": round(st["min"], 3) if st else None,
+                "rtt_avg_ms": round(st["avg"], 3) if st else None,
+                "rtt_max_ms": round(st["max"], 3) if st else None,
+                "rtt_mdev_ms": round(st["mdev"], 3) if st else None,
+                "jitter_ms": round(jt, 3) if jt is not None else None,
+            }
+        print(json.dumps({
+            "type": "summary",
+            "mode": "compare",
+            "host": args.host,
+            "port": args.port,
+            "proto": args.proto,
+            "ifaces": ifaces,
+            "series": series,
+            "overhead_ms": round(overhead, 3) if overhead is not None else None,
+        }), flush=True)
+    else:
+        print(f"--- {args.host} tunping compare statistics ({a} vs {b}) ---")
+        for idx, ifname in enumerate(ifaces):
+            t = transmitted[idx]
+            r = len(rtts[idx])
+            st = stats[idx]
+            loss = 100.0 * (t - r) / t if t else 0.0
+            print(f"{ifname}: {t} transmitted, {r} received, {loss:.1f}% loss")
+            if st:
+                print(
+                    f"{ifname}: rtt min/avg/max/mdev = "
+                    f"{st['min']:.3f}/{st['avg']:.3f}/"
+                    f"{st['max']:.3f}/{st['mdev']:.3f} ms"
+                )
+        if overhead is not None:
+            print(f"overhead ({a}-{b}) = {overhead:+.3f} ms")
+    return 0 if received_total > 0 else 1
+
+
+def run_compare(args: argparse.Namespace) -> int:
+    ifaces = list(args.compare)
+    use_tls = args.proto == "https"
+    host_header = args.sni or args.host
+    if args.port not in (80, 443):
+        host_header = f"{host_header}:{args.port}"
+    request = build_request(host_header)
+
+    for ifname in ifaces:
+        try:
+            validate_iface(ifname)
+        except OSError as e:
+            if args.json:
+                print(json.dumps({"type": "error", "error": str(e)}), flush=True)
+            else:
+                print(f"tunping: {e}", file=sys.stderr)
+            return 2
+
+    conns: list[socket.socket | None] = [None] * len(ifaces)
+    sock_ips: list[str] = ["?"] * len(ifaces)
+    rtts: list[list[float]] = [[] for _ in ifaces]
+    transmitted: list[int] = [0] * len(ifaces)
+
+    if not args.json:
+        print(f"TUNPING {args.host} ({args.port}) compare {' vs '.join(ifaces)} with HTTPS TTFB")
+
+    seq = 0
+    counted = 0
+    try:
+        while True:
+            if args.count and counted >= args.count:
+                break
+            seq += 1
+            is_warm = seq <= args.warmup
+            round_start = time.monotonic()
+            results: list[tuple[bool, float, str]] = []
+            for idx, ifname in enumerate(ifaces):
+                if not is_warm:
+                    transmitted[idx] += 1
+                if conns[idx] is None:
+                    try:
+                        conns[idx], sock_ips[idx] = create_connection(
+                            args.host, args.port, args.timeout, use_tls,
+                            args.sni, args.insecure, bind_if=ifname,
+                        )
+                    except OSError as e:
+                        results.append((False, 0.0, f"connect failed: {e}"))
+                        continue
+                ok, rtt, err, dead = ttfb_probe(conns[idx], request, args.timeout)
+                if dead:
+                    try:
+                        conns[idx].close()
+                    except OSError:
+                        pass
+                    conns[idx] = None
+                if ok and not is_warm:
+                    rtts[idx].append(rtt)
+                results.append((ok, rtt, err))
+            if not is_warm:
+                counted += 1
+
+            if args.json:
+                for idx, ifname in enumerate(ifaces):
+                    ok, rtt, err = results[idx]
+                    rec: dict = {"type": "probe", "seq": seq, "iface": ifname,
+                                 "ok": ok, "host": args.host,
+                                 "ip": sock_ips[idx], "port": args.port,
+                                 "warmup": is_warm}
+                    if ok:
+                        rec["ttfb_ms"] = round(rtt, 3)
+                    else:
+                        rec["error"] = err or "timeout"
+                    print(json.dumps(rec), flush=True)
+            else:
+                parts = []
+                for idx, ifname in enumerate(ifaces):
+                    ok, rtt, err = results[idx]
+                    parts.append(f"{ifname}={rtt:.1f} ms" if ok else f"{ifname}=timeout")
+                line = f"seq={seq} " + " ".join(parts)
+                both_ok = [r for ok_, r, _ in results if ok_]
+                if len(both_ok) == 2:
+                    line += f" delta={both_ok[0] - both_ok[1]:+.1f} ms"
+                if is_warm:
+                    line += " (warmup)"
+                print(line)
+
+            if args.count and counted >= args.count:
+                break
+            elapsed = time.monotonic() - round_start
+            to_sleep = args.interval - elapsed
+            if to_sleep > 0:
+                time.sleep(to_sleep)
+    except KeyboardInterrupt:
+        if not args.json:
+            print()
+    finally:
+        for sock in conns:
+            try:
+                if sock is not None:
+                    sock.close()
+            except OSError:
+                pass
+
+    return print_compare_summary(args, ifaces, transmitted, rtts)
 
 
 if __name__ == "__main__":

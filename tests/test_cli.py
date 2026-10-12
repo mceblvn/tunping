@@ -22,6 +22,7 @@ def test_parse_args_defaults():
     assert args.timeout == 5.0
     assert args.proto == "https"
     assert args.json is False
+    assert args.warmup == 1
 
 
 def test_parse_args_rejects_bad_values():
@@ -33,6 +34,8 @@ def test_parse_args_rejects_bad_values():
         parse_args(["h", "--port", "99999"])
     with pytest.raises(SystemExit):
         parse_args(["h", "--timeout", "0"])
+    with pytest.raises(SystemExit):
+        parse_args(["h", "--warmup", "-1"])
 
 
 def test_print_summary_empty_is_loss(capsys):
@@ -154,7 +157,8 @@ def test_main_against_local_http_json(capsys):
     port, stop = _run_fake_http_server()
     try:
         rc = main(["127.0.0.1", "-c", "2", "--proto", "http",
-                   "--port", str(port), "-i", "0", "--timeout", "3", "--json"])
+                   "--port", str(port), "-i", "0", "--timeout", "3", "--json",
+                   "--warmup", "0"])
         assert rc == 0
         lines = capsys.readouterr().out.strip().splitlines()
         assert len(lines) == 3

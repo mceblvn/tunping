@@ -1,8 +1,10 @@
 # tunping
 
-If `ping` shows `0.01 ms` with `ttl=64` after you enable the VPN, the ping is
-intercepted and answered locally. ICMP lies.
-`tunping` measures the real latency instead.
+If `ping` shows something like `0.01 ms` with `ttl=64` after you enable
+the VPN, the ping is intercepted and answered locally. ICMP lies.
+`tunping` measures the real latency instead. With `--compare` it runs
+the same probe via two interfaces (VPN and direct), so the VPN overhead
+shows up as one number.
 
 > This is **NOT ICMP.** `tunping` times an HTTPS round-trip (`HEAD /` → first
 > response byte) over one persistent connection.
@@ -71,12 +73,15 @@ tunping 1.1.1.1 -c 4 --json
 tunping example.com -c 10 -i 0.5 --port 443 --timeout 5
 tunping 1.1.1.1 --proto http --port 80 -c 2
 tunping 1.1.1.1 --sni cloudflare-dns.com --insecure -c 2  # SNI override
+tunping 1.1.1.1 -c 4 --compare tun2 enp14s0
 ```
+
+`--compare` probes both interfaces and shows the delta
 
 Output mimics ping by default:
 
 ```
-TUNPING 1.1.1.1 (1.1.1.1:443) with HTTPS TTFB (not ICMP; for TUNs that answer ping locally)
+TUNPING 1.1.1.1 (1.1.1.1:443) with HTTPS TTFB
 response from 1.1.1.1 (1.1.1.1): seq=1 ttfb=182.4 ms
 ...
 --- 1.1.1.1 tunping statistics ---
