@@ -1,0 +1,15 @@
+pkgbase = tunping
+	pkgdesc = Ping-like latency probe for TUN/SOCKS VPNs that answer ICMP locally (HTTPS TTFB, not ICMP)
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/mceblvn/tunping
+	arch = any
+	license = MIT
+	makedepends = python-build
+	makedepends = python-installer
+	makedepends = python-setuptools
+	depends = python
+	source = tunping-0.1.0.tar.gz::https://files.pythonhosted.org/packages/source/t/tunping/tunping-0.1.0.tar.gz
+	sha256sums = 653562ce1d19831a42f5ba17852ee033ad314f9a86bb8db288013db3ba60e32e
+
+pkgname = tunping

@@ -30,7 +30,7 @@ $ traceroute -n 1.1.1.1
  2  * * *
 ```
 
-The true round-trip is way slower:
+The true round-trip is slower:
 
 ```
 $ tunping 1.1.1.1 -c 1
@@ -39,8 +39,26 @@ response from 1.1.1.1 (1.1.1.1): seq=1 ttfb=100.0 ms
 
 ## Install
 
+All distros (pipx):
+
 ```bash
-pip install -e .
+pipx install tunping
+```
+
+Without pipx/uv:
+
+```bash
+python3 -m venv tunping-venv
+source tunping-venv/bin/activate
+pip install tunping
+```
+
+Arch Linux:
+
+```bash
+git clone https://github.com/mceblvn/tunping.git
+cd tunping/packaging/aur
+makepkg -si
 ```
 
 Python >= 3.10, stdlib only, no deps.
@@ -68,7 +86,7 @@ jitter = 2.1 ms
 ```
 
 JSON (`--json`): one object per probe `{"type":"probe",...}` plus final
-`{"type":"summary",...}` — handy for graphs.
+`{"type":"summary",...}` is handy for graphs/scripts.
 
 Exit codes: `0` if any probe succeeded, `1` if all lost, `2` on usage error.
 
