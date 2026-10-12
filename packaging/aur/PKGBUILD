@@ -1,6 +1,6 @@
 # Maintainer: mceblvn <mceblvn@users.noreply.github.com>
 pkgname=tunping
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Ping-like latency probe for TUN/SOCKS VPNs that answer ICMP locally (HTTPS TTFB, not ICMP)"
 arch=('any')
@@ -8,8 +8,8 @@ url="https://github.com/mceblvn/tunping"
 license=('MIT')
 depends=('python')
 makedepends=('python-build' 'python-installer' 'python-setuptools')
-source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/source/${pkgname::1}/$pkgname/$pkgname-$pkgver.tar.gz")
-sha256sums=('653562ce1d19831a42f5ba17852ee033ad314f9a86bb8db288013db3ba60e32e')
+source=("$pkgname-$pkgver.tar.gz::https://files.pythonhosted.org/packages/83/63/91fa3d2ea189f5519d5454f0f1c7bc6361e47e5bf74ec915d9a2ec04b075/$pkgname-$pkgver.tar.gz")
+sha256sums=('a317d922d223894090b986c3dd4342144f6ee29aa0002f093bf2f4edabcfff7d')
 
 build() {
   cd "$pkgname-$pkgver"
